@@ -447,9 +447,11 @@ bool FPCGExPCGDataAssetLoaderElement::Boot(FPCGExContext* InContext) const
 
 	// Setup collection unpacker
 	Context->CollectionUnpacker = MakeShared<PCGExCollections::FPickUnpacker>();
-	Context->CollectionUnpacker->UnpackPin(InContext);
+	// Deferred (cancel-safe) unpack: registers the referenced collections as async asset dependencies
+	// instead of blocking-loading them here on the worker. Resolved in the initial execution below.
+	Context->CollectionUnpacker->UnpackPinDeferred(InContext);
 
-	if (!Context->CollectionUnpacker->HasValidMapping())
+	if (!Context->CollectionUnpacker->HasCollectedPicks())
 	{
 		PCGE_LOG(Error, GraphAndLog, FTEXT("Could not rebuild a valid asset mapping from the provided map."));
 		return false;
@@ -480,6 +482,12 @@ bool FPCGExPCGDataAssetLoaderElement::AdvanceWork(FPCGExContext* InContext, cons
 
 	PCGEX_ON_INITIAL_EXECUTION
 	{
+		// Collections were registered as async dependencies in Boot and are now loaded; build the map.
+		if (!Context->CollectionUnpacker->ResolveDeferred(Context))
+		{
+			return Context->CancelExecution(TEXT("Could not rebuild a valid asset mapping from the provided map."));
+		}
+
 		if (!Context->StartBatchProcessingPoints(
 			[&](const TSharedPtr<PCGExData::FPointIO>& Entry)
 			{

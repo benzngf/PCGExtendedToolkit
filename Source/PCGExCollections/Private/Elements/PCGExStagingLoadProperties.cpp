@@ -39,9 +39,12 @@ bool FPCGExStagingLoadPropertiesElement::Boot(FPCGExContext* InContext) const
 	PCGEX_CONTEXT_AND_SETTINGS(StagingLoadProperties)
 
 	Context->CollectionPickUnpacker = MakeShared<PCGExCollections::FPickUnpacker>();
-	Context->CollectionPickUnpacker->UnpackPin(InContext, PCGExCollections::Labels::SourceCollectionMapLabel);
+	// Deferred (cancel-safe) unpack: registers the referenced collections as async asset dependencies
+	// instead of blocking-loading them here on the worker. The collection map is built in
+	// ResolveDeferred() once the context's asset phase has loaded them (see initial execution below).
+	Context->CollectionPickUnpacker->UnpackPinDeferred(InContext, PCGExCollections::Labels::SourceCollectionMapLabel);
 
-	if (!Context->CollectionPickUnpacker->HasValidMapping())
+	if (!Context->CollectionPickUnpacker->HasCollectedPicks())
 	{
 		PCGE_LOG(Error, GraphAndLog, FTEXT("Could not rebuild a valid asset mapping from the provided map."));
 		return false;
@@ -94,6 +97,12 @@ bool FPCGExStagingLoadPropertiesElement::AdvanceWork(FPCGExContext* InContext, c
 	PCGEX_EXECUTION_CHECK
 	PCGEX_ON_INITIAL_EXECUTION
 	{
+		// Collections were registered as async dependencies in Boot and are now loaded; build the map.
+		if (!Context->CollectionPickUnpacker->ResolveDeferred(Context))
+		{
+			return Context->CancelExecution(TEXT("Could not rebuild a valid asset mapping from the provided map."));
+		}
+
 		if (!Context->StartBatchProcessingPoints(
 			[&](const TSharedPtr<PCGExData::FPointIO>& Entry)
 			{

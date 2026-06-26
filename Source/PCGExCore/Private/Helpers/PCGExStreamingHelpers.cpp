@@ -18,6 +18,19 @@ namespace PCGExHelpers
 		// Thread-safe synchronous asset loading. UAssetManager requires game-thread access,
 		// so when called from a worker thread, dispatch to game thread and block until complete.
 		// The context tracks the handle to prevent premature GC of loaded assets.
+		//
+		// DEADLOCK WARNING: "AnyThread" means callable from any thread, NOT completable without the
+		// game thread -- the off-thread branch below marshals to the game thread and blocks
+		// (ExecuteOnMainThreadAndWait). The streamable manager structurally requires the game thread
+		// to complete a load (FlushAsyncLoading is GT/ALT-only; FStreamableHandle completion and
+		// release are game-thread-only), so this cannot be made truly worker-completable.
+		// Therefore: DO NOT call this from a path that the task can be cancelled mid-flight on a worker
+		// (e.g. a PCGEx element's Boot()/Execute()). PCG's FPCGGraphExecutor::Cancel() blocks the game
+		// thread waiting on that worker task BEFORE it calls Abort(), so the game thread never services
+		// the marshaled load -> the worker waits on the GT, the GT waits on the worker -> hard deadlock.
+		// For those paths use the async dependency flow instead: FPCGExContext::AddAssetDependency()
+		// during prepare (which pauses the context, so Cancel() takes PCG's no-wait paused-task path),
+		// or PCGExHelpers::Load() / FPickUnpacker::UnpackPinDeferred() + ResolveDeferred().
 		TSharedPtr<FStreamableHandle> Handle;
 		if (IsInGameThread())
 		{
@@ -40,6 +53,9 @@ namespace PCGExHelpers
 
 	TSharedPtr<FStreamableHandle> LoadBlocking_AnyThread(const TSharedPtr<TSet<FSoftObjectPath>>& Paths, FPCGExContext* InContext)
 	{
+		// DEADLOCK WARNING: see the single-path overload above. Off the game thread this marshals to
+		// the GT and blocks, so it must not be used on a worker path that can be cancelled mid-flight
+		// (PCGEx element Boot()/Execute()). Prefer the async dependency flow there.
 		TSharedPtr<FStreamableHandle> Handle;
 		if (IsInGameThread())
 		{

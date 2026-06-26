@@ -22,6 +22,7 @@ namespace PCGExDetails
 }
 
 struct FPCGContext;
+struct FPCGExContext;
 struct FPCGMeshInstanceList;
 struct FPCGSkinnedMeshInstanceList;
 class UPCGBasePointData;
@@ -323,6 +324,18 @@ namespace PCGExCollections
 		int32 NumUniqueEntries = 0;
 		const UPCGBasePointData* PointData = nullptr;
 
+		// Picks collected from the Collection Map attribute set(s), keyed by CollectionIdx -> collection
+		// asset path. Populated by CollectDataset (no loading), then turned into CollectionMap by
+		// BuildResolvedMap once the referenced collections are in memory. Drives both the blocking
+		// (UnpackPin) and the cancel-safe deferred (UnpackPinDeferred + ResolveDeferred) paths.
+		TMap<int32, FSoftObjectPath> CollectedCollectionPaths;
+
+		/** Validate the attribute set and accumulate its (CollectionIdx -> path) picks into CollectedCollectionPaths. No loading. */
+		bool CollectDataset(FPCGContext* InContext, const UPCGParamData* InAttributeSet);
+
+		/** Build CollectionMap from CollectedCollectionPaths. Collections must already be loaded. Idempotent. */
+		bool BuildResolvedMap(FPCGContext* InContext);
+
 	public:
 		TMap<int64, TSharedPtr<TArray<int32>>> HashedPartitions;
 		TMap<int64, int32> IndexedPartitions;
@@ -335,17 +348,61 @@ namespace PCGExCollections
 			return !CollectionMap.IsEmpty();
 		}
 
+		/**
+		 * True once picks have been collected (a valid Collection Map input was found), even if the
+		 * referenced collections have not been resolved yet. Use this as the Boot-time validity check
+		 * on the deferred path, where HasValidMapping() is only true after ResolveDeferred().
+		 */
+		bool HasCollectedPicks() const
+		{
+			return !CollectedCollectionPaths.IsEmpty();
+		}
+
 		/** Get read-only access to the collection map */
 		const TMap<uint32, UPCGExAssetCollection*>& GetCollections() const
 		{
 			return CollectionMap;
 		}
 
-		/** Unpack collection mappings from an attribute set */
+		/**
+		 * Unpack collection mappings from an attribute set.
+		 * WARNING: blocking load. Safe only on the game thread or in non-cancellable contexts.
+		 * In a cancellable element prepare/execute path, use UnpackPinDeferred + ResolveDeferred instead
+		 * (see UnpackPin / LoadBlocking_AnyThread for why a blocking load deadlocks against a mid-flight cancel).
+		 */
 		bool UnpackDataset(FPCGContext* InContext, const UPCGParamData* InAttributeSet);
 
-		/** Unpack from a specific input pin */
+		/**
+		 * Unpack from a specific input pin.
+		 * WARNING: blocking load (calls LoadBlocking_AnyThread). Safe only on the game thread or in
+		 * non-cancellable contexts (e.g. mesh selectors). Inside a PCGEx element's Boot()/Execute(),
+		 * which run on a worker that PCG's Cancel() waits on, this can deadlock -- use the deferred
+		 * pair below instead.
+		 */
 		void UnpackPin(FPCGContext* InContext, FName InPinLabel = NAME_None);
+
+		/**
+		 * Cancel-safe, two-phase replacement for UnpackPin(), for use from a PCGEx element's Boot().
+		 *
+		 * Phase 1 (this call): reads the Collection Map input pin and registers every referenced
+		 * collection as an async asset dependency on the context (FPCGExContext::AddAssetDependency)
+		 * WITHOUT blocking. The element's normal asset-loading phase then streams them in via the
+		 * task system, with the context paused -- so a concurrent Cancel() resolves through PCG's
+		 * no-wait paused-task path instead of blocking the game thread on a worker.
+		 *
+		 * Check HasCollectedPicks() after this to validate a map input was found.
+		 *
+		 * Phase 2: call ResolveDeferred() once the assets are loaded (e.g. at the start of the
+		 * initial execution, or in PostLoadAssetsDependencies) to build the collection map.
+		 */
+		void UnpackPinDeferred(FPCGExContext* InContext, FName InPinLabel = NAME_None);
+
+		/**
+		 * Resolve the collection map from the dependencies registered by UnpackPinDeferred().
+		 * Must be called after the referenced collections have finished loading. Idempotent.
+		 * @return HasValidMapping() -- false if a referenced collection failed to resolve.
+		 */
+		bool ResolveDeferred(FPCGExContext* InContext);
 
 		/**
 		 * Build point partitions from point data.

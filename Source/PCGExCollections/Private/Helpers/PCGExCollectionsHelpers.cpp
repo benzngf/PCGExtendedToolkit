@@ -365,8 +365,11 @@ namespace PCGExCollections
 		PCGExHelpers::SafeReleaseHandle(CollectionsHandle);
 	}
 
-	bool FPickUnpacker::UnpackDataset(FPCGContext* InContext, const UPCGParamData* InAttributeSet)
+	bool FPickUnpacker::CollectDataset(FPCGContext* InContext, const UPCGParamData* InAttributeSet)
 	{
+		// Validate the attribute set and accumulate its (CollectionIdx -> path) picks into
+		// CollectedCollectionPaths. This does NOT load anything -- both the blocking and the deferred
+		// paths share this, then differ only in how/when the collections are brought into memory.
 		const UPCGMetadata* Metadata = InAttributeSet->Metadata;
 		TUniquePtr<FPCGAttributeAccessorKeysEntries> Keys = MakeUnique<FPCGAttributeAccessorKeysEntries>(Metadata);
 
@@ -377,8 +380,6 @@ namespace PCGExCollections
 			return false;
 		}
 
-		CollectionMap.Reserve(CollectionMap.Num() + NumEntries);
-
 		const FPCGMetadataAttribute<int32>* CollectionIdx = InAttributeSet->Metadata->GetConstTypedAttribute<int32>(Labels::Tag_CollectionIdx);
 		const FPCGMetadataAttribute<FSoftObjectPath>* CollectionPath = InAttributeSet->Metadata->GetConstTypedAttribute<FSoftObjectPath>(Labels::Tag_CollectionPath);
 
@@ -388,56 +389,91 @@ namespace PCGExCollections
 			return false;
 		}
 
-		{
-			TSharedPtr<TSet<FSoftObjectPath>> CollectionPaths = MakeShared<TSet<FSoftObjectPath>>();
-
-			for (int32 i = 0; i < NumEntries; i++)
-			{
-				CollectionPaths->Add(CollectionPath->GetValueFromItemKey(i));
-			}
+		CollectedCollectionPaths.Reserve(CollectedCollectionPaths.Num() + NumEntries);
 
 #if WITH_EDITOR
-			FPCGDynamicTrackingHelper DynamicTracking;
-			DynamicTracking.EnableAndInitialize(InContext, CollectionPaths->Num());
-			for (const FSoftObjectPath& Path : *CollectionPaths.Get())
-			{
-				DynamicTracking.AddToTracking(FPCGSelectionKey::CreateFromPath(Path), /*bIsCulled=*/ false);
-			}
-			DynamicTracking.Finalize(InContext);
+		FPCGDynamicTrackingHelper DynamicTracking;
+		DynamicTracking.EnableAndInitialize(InContext, NumEntries);
 #endif
-
-			CollectionsHandle = PCGExHelpers::LoadBlocking_AnyThread(CollectionPaths);
-		}
 
 		for (int32 i = 0; i < NumEntries; i++)
 		{
-			int32 Idx = CollectionIdx->GetValueFromItemKey(i);
+			const int32 Idx = CollectionIdx->GetValueFromItemKey(i);
+			const FSoftObjectPath Path = CollectionPath->GetValueFromItemKey(i);
 
-			TSoftObjectPtr<UPCGExAssetCollection> CollectionSoftPtr(CollectionPath->GetValueFromItemKey(i));
-			UPCGExAssetCollection* Collection = CollectionSoftPtr.Get();
+			if (const FSoftObjectPath* Existing = CollectedCollectionPaths.Find(Idx))
+			{
+				// Same identifier resolving to two different collections -- the map is inconsistent.
+				// (A repeat of the same (Idx, Path) is expected across rows and is fine.)
+				if (*Existing != Path)
+				{
+					PCGE_LOG_C(Error, GraphAndLog, InContext, FTEXT("Collection Idx collision."));
+					return false;
+				}
+				continue;
+			}
 
+			CollectedCollectionPaths.Add(Idx, Path);
+
+#if WITH_EDITOR
+			DynamicTracking.AddToTracking(FPCGSelectionKey::CreateFromPath(Path), /*bIsCulled=*/ false);
+#endif
+		}
+
+#if WITH_EDITOR
+		DynamicTracking.Finalize(InContext);
+#endif
+
+		return true;
+	}
+
+	bool FPickUnpacker::BuildResolvedMap(FPCGContext* InContext)
+	{
+		// Turn the collected picks into the live CollectionMap. Collections must already be in memory
+		// (blocking-loaded by UnpackDataset, or streamed in by the element's async dependency phase
+		// before ResolveDeferred is called). Idempotent: skips identifiers already resolved.
+		CollectionMap.Reserve(CollectionMap.Num() + CollectedCollectionPaths.Num());
+
+		for (const TPair<int32, FSoftObjectPath>& Pair : CollectedCollectionPaths)
+		{
+			if (CollectionMap.Contains(Pair.Key))
+			{
+				continue;
+			}
+
+			UPCGExAssetCollection* Collection = TSoftObjectPtr<UPCGExAssetCollection>(Pair.Value).Get();
 			if (!Collection)
 			{
 				PCGE_LOG_C(Error, GraphAndLog, InContext, FTEXT("Some collections could not be loaded."));
 				return false;
 			}
 
-			if (CollectionMap.Contains(Idx))
-			{
-				if (CollectionMap[Idx] == Collection)
-				{
-					continue;
-				}
-
-				PCGE_LOG_C(Error, GraphAndLog, InContext, FTEXT("Collection Idx collision."));
-				return false;
-			}
-
-			CollectionMap.Add(Idx, Collection);
+			CollectionMap.Add(Pair.Key, Collection);
 			NumUniqueEntries += Collection->GetValidEntryNum();
 		}
 
-		return true;
+		return HasValidMapping();
+	}
+
+	bool FPickUnpacker::UnpackDataset(FPCGContext* InContext, const UPCGParamData* InAttributeSet)
+	{
+		// Blocking path: collect, synchronously load, then resolve. See UnpackDataset's header warning --
+		// only use this on the game thread or in non-cancellable contexts.
+		if (!CollectDataset(InContext, InAttributeSet))
+		{
+			return false;
+		}
+
+		TSharedPtr<TSet<FSoftObjectPath>> CollectionPaths = MakeShared<TSet<FSoftObjectPath>>();
+		CollectionPaths->Reserve(CollectedCollectionPaths.Num());
+		for (const TPair<int32, FSoftObjectPath>& Pair : CollectedCollectionPaths)
+		{
+			CollectionPaths->Add(Pair.Value);
+		}
+
+		CollectionsHandle = PCGExHelpers::LoadBlocking_AnyThread(CollectionPaths);
+
+		return BuildResolvedMap(InContext);
 	}
 
 	void FPickUnpacker::UnpackPin(FPCGContext* InContext, const FName InPinLabel)
@@ -459,6 +495,43 @@ namespace PCGExCollections
 
 			UnpackDataset(InContext, ParamData);
 		}
+	}
+
+	void FPickUnpacker::UnpackPinDeferred(FPCGExContext* InContext, const FName InPinLabel)
+	{
+		// Phase 1: collect picks (no loading) and register the referenced collections as async asset
+		// dependencies on the context. The element's asset-loading phase streams them in while the
+		// context is paused, so this never blocks a worker and cannot deadlock a mid-flight Cancel().
+		for (TArray<FPCGTaggedData> Params = InContext->InputData.GetParamsByPin(InPinLabel.IsNone() ? Labels::SourceCollectionMapLabel : InPinLabel);
+		     const FPCGTaggedData& InTaggedData : Params)
+		{
+			const UPCGParamData* ParamData = Cast<UPCGParamData>(InTaggedData.Data);
+
+			if (!ParamData)
+			{
+				continue;
+			}
+
+			if (!ParamData->Metadata->HasAttribute(Labels::Tag_CollectionIdx) || !ParamData->Metadata->HasAttribute(Labels::Tag_CollectionPath))
+			{
+				continue;
+			}
+
+			CollectDataset(InContext, ParamData);
+		}
+
+		for (const TPair<int32, FSoftObjectPath>& Pair : CollectedCollectionPaths)
+		{
+			InContext->AddAssetDependency(Pair.Value);
+		}
+	}
+
+	bool FPickUnpacker::ResolveDeferred(FPCGExContext* InContext)
+	{
+		// Phase 2: the collections registered in UnpackPinDeferred have now been loaded by the
+		// context's async asset phase (the handle is kept alive by the context, so no CollectionsHandle
+		// is needed here). Build the live map.
+		return BuildResolvedMap(InContext);
 	}
 
 	// Groups points by their entry hash into FPCGMeshInstanceList partitions.
