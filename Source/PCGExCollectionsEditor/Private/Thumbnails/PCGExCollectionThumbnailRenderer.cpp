@@ -13,6 +13,8 @@
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/Texture2D.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "UObject/Package.h"
 #include "Misc/ObjectThumbnail.h"
 #include "ThumbnailRendering/ThumbnailManager.h"
 
@@ -137,22 +139,75 @@ void UPCGExCollectionThumbnailRenderer::DrawCell(const FSoftObjectPath& AssetPat
 		return;
 	}
 
-	// No cached thumbnail: delegate to the loaded child's own renderer if it has one.
+	// No cached thumbnail (e.g. transient objects): delegate to the loaded child's own renderer if it has one.
 	if (LoadedObject)
 	{
 		if (FThumbnailRenderingInfo* RenderInfo = UThumbnailManager::Get().GetRenderingInfo(LoadedObject);
 			RenderInfo && RenderInfo->Renderer && RenderInfo->Renderer->CanVisualizeAsset(LoadedObject))
 		{
-			RenderInfo->Renderer->Draw(
-				LoadedObject,
-				FMath::TruncToInt(X), FMath::TruncToInt(Y),
-				FMath::TruncToInt(Width), FMath::TruncToInt(Height),
-				Viewport, Canvas, /*bAdditionalViewFamily=*/true);
+			DrawDelegatedCell(LoadedObject, RenderInfo->Renderer, X, Y, Width, Height, Canvas);
 			return;
 		}
 	}
 
 	DrawPlaceholder(X, Y, Width, Height, Canvas, EmptyCellColor);
+}
+
+void UPCGExCollectionThumbnailRenderer::DrawDelegatedCell(UObject* Object, UThumbnailRenderer* Renderer, float X, float Y, float Width, float Height, FCanvas* Canvas)
+{
+	const int32 CellWidth = FMath::Max(1, FMath::TruncToInt(Width));
+	const int32 CellHeight = FMath::Max(1, FMath::TruncToInt(Height));
+
+	UTextureRenderTarget2D* CellTarget = GetDelegateRenderTarget(CellWidth, CellHeight, DelegateDepth);
+	FTextureRenderTargetResource* CellResource = CellTarget ? CellTarget->GameThread_GetRenderTargetResource() : nullptr;
+	if (!CellResource)
+	{
+		DrawPlaceholder(X, Y, Width, Height, Canvas, PCGExCollectionThumbnail::EmptyCellColor);
+		return;
+	}
+
+	// The child sees a whole target at the origin, exactly as when the thumbnail pool renders it directly.
+	{
+		TGuardValue<int32> DepthGuard(DelegateDepth, DelegateDepth + 1);
+
+		FCanvas CellCanvas(CellResource, nullptr, FGameTime::GetTimeSinceAppStart(), Canvas->GetFeatureLevel());
+		CellCanvas.Clear(FLinearColor::Black);
+		Renderer->Draw(Object, 0, 0, CellWidth, CellHeight, CellResource, &CellCanvas, /*bAdditionalViewFamily=*/true);
+		CellCanvas.Flush_GameThread();
+	}
+
+	FCanvasTileItem Tile(FVector2D(X, Y), CellResource, FVector2D(Width, Height), FLinearColor::White);
+	Tile.BlendMode = SE_BLEND_Opaque;
+	Canvas->DrawItem(Tile);
+
+	// Submit now: the next delegated cell of this size reuses CellTarget, and render-thread order keeps
+	// this tile's read ahead of that overwrite.
+	Canvas->Flush_GameThread();
+}
+
+UTextureRenderTarget2D* UPCGExCollectionThumbnailRenderer::GetDelegateRenderTarget(int32 Width, int32 Height, int32 Depth)
+{
+	const FIntVector Key(Width, Height, Depth);
+	if (const TObjectPtr<UTextureRenderTarget2D>* Existing = DelegateRenderTargets.Find(Key))
+	{
+		return Existing->Get();
+	}
+
+	if (DelegateRenderTargets.Num() >= MaxDelegateRenderTargets)
+	{
+		DelegateRenderTargets.Empty(MaxDelegateRenderTargets);
+	}
+
+	// Same setup as the editor's thumbnail scratch targets, so delegated cells match a direct render.
+	UTextureRenderTarget2D* Target = NewObject<UTextureRenderTarget2D>(GetTransientPackage(), NAME_None, RF_Transient);
+	Target->ClearColor = FLinearColor::Black;
+	Target->TargetGamma = GEngine ? GEngine->DisplayGamma : 2.2f;
+	Target->RenderTargetFormat = RTF_RGBA8;
+	Target->InitAutoFormat(Width, Height);
+	Target->UpdateResourceImmediate(/*bClearRenderTarget=*/true);
+
+	DelegateRenderTargets.Add(Key, Target);
+	return Target;
 }
 
 void UPCGExCollectionThumbnailRenderer::DrawPlaceholder(float X, float Y, float Width, float Height, FCanvas* Canvas, const FLinearColor& Color) const

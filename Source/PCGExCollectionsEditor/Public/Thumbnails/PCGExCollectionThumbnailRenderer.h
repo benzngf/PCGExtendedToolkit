@@ -12,6 +12,7 @@ class FCanvas;
 class FRenderTarget;
 class UPCGExAssetCollection;
 class UTexture2D;
+class UTextureRenderTarget2D;
 
 /**
  * Thumbnail renderer for all UPCGExAssetCollection types (registered on the base class by the
@@ -19,8 +20,8 @@ class UTexture2D;
  * past 9 entries the last cell shows a "+N" overflow count.
  *
  * Per-cell resolution, cheapest-first: nested subcollection -> recursive mosaic (depth-capped);
- * cached package thumbnail (no asset load); loaded child's own renderer (delegated sub-rect);
- * placeholder.
+ * cached package thumbnail (no asset load); loaded child's own renderer (rendered offscreen, then
+ * tiled into the cell); placeholder.
  *
  * OnPropertyChange frequency: the pool re-renders on edit and the editor bakes the result into the
  * package thumbnail on save, so unloaded assets show the mosaic in the content browser too.
@@ -64,7 +65,27 @@ protected:
 	/** Evict the cached cell texture for a dirtied asset so the next render rebuilds it. */
 	void OnThumbnailDirtied(const FSoftObjectPath& AssetPath);
 
+	/**
+	 * Render a loaded child through its own renderer into an offscreen target, then tile that into the cell.
+	 * Drawing the child straight onto our canvas is wrong for renderers that bypass the canvas: e.g. UI
+	 * materials (incl. transient MIDs, which have no cached thumbnail) go through FWidgetRenderer, which
+	 * draws at the target origin, clears it, and is then painted over when our batched tiles flush.
+	 */
+	void DrawDelegatedCell(UObject* Object, UThumbnailRenderer* Renderer, float X, float Y, float Width, float Height, FCanvas* Canvas);
+
 private:
+	/** Offscreen target for delegated cells, keyed by (size, re-entry depth); reused across renders. */
+	UTextureRenderTarget2D* GetDelegateRenderTarget(int32 Width, int32 Height, int32 Depth);
+
+	/** Soft cap on cached delegate targets; dropped wholesale when exceeded. */
+	static constexpr int32 MaxDelegateRenderTargets = 16;
+
+	UPROPERTY(Transient)
+	TMap<FIntVector, TObjectPtr<UTextureRenderTarget2D>> DelegateRenderTargets;
+
+	/** Nesting of DrawDelegatedCell on this instance, so a re-entrant draw never reuses an in-flight target. */
+	int32 DelegateDepth = 0;
+
 	/** Subscribe to UThumbnailManager::OnThumbnailDirtied exactly once (lazy, on first build). */
 	void EnsureThumbnailDirtyListener();
 
